@@ -70,12 +70,13 @@ class ForensicFlowAnalyzer:
         source_corrected = self.df[self.source_col].shift(lag) * gain
         
         if smoothing > 1:
-            source_corrected = source_corrected.rolling(window=smoothing).mean()
-            sink_smoothed = self.df[self.sink_col].rolling(window=smoothing).mean()
+            # Changed from .mean() to .median() for aggressive spike removal
+            source_corrected = source_corrected.rolling(window=smoothing, center=True, min_periods=1).median()
+            sink_smoothed = self.df[self.sink_col].rolling(window=smoothing, center=True, min_periods=1).median()
         else:
             sink_smoothed = self.df[self.sink_col]
             
-        return source_corrected, sink_smoothed
+        return source_corrected, sink_smoothedk_smoothed
 
 # --- CALIBRATION & STACKING FUNCTION ---
 @st.cache_data
