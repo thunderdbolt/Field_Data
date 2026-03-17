@@ -157,4 +157,143 @@ with st.sidebar:
         # Prepare the dataframe
         df[source_col] = pd.to_numeric(df[source_col], errors='coerce')
         df[sink_col] = pd.to_numeric(df[sink_col], errors='coerce')
-        df = df.dropna(subset
+        df = df.dropna(subset=[source_col, sink_col])
+
+        analyzer = ForensicFlowAnalyzer(df, source_col, sink_col)
+        anomalies = analyzer.detect_anomalies()
+        suggested_lag = analyzer.get_optimal_lag()
+        suggested_gain = analyzer.get_auto_calibration_factor()
+    except Exception as e:
+        st.error(f"Error processing data mapping: {e}")
+        st.stop()
+
+# ==========================================
+# 4. FORENSIC CONTROLS
+# ==========================================
+with st.sidebar:
+    st.divider()
+    st.header("2. Forensic Controls")
+    
+    st.subheader("Time Alignment")
+    st.info(f"Detected Lag: **{suggested_lag} units**")
+    if st.button("Apply Auto-Lag", use_container_width=True):
+        st.session_state['lag_val'] = int(suggested_lag)
+        
+    lag = st.slider("Manual Lag Adjustment", -20, 20, key='lag_val')
+
+    st.subheader("Meter Calibration")
+    st.info(f"Suggested Gain: **{suggested_gain:.3f}**")
+    if st.button("Apply Auto-Calibration", use_container_width=True):
+        st.session_state['gain_val'] = float(suggested_gain)
+
+    gain = st.number_input("Calibration Factor", 0.0, 5.0, step=0.01, format="%.3f", key='gain_val')
+
+    pressure_offset = st.number_input("Pressure Offset (psig)", -500.0, 500.0, value=0.0, step=5.0, 
+                                      help="Accounts for sensor zero-drift or elevation.")
+
+    st.divider()
+    smoothing = st.slider("Smoothing Window", 1, 20, 1)
+    
+    st.subheader("Meeting Points Criteria")
+    tolerance_pct = st.slider("Tolerance %", 0.0, 10.0, 0.32, step=0.01) / 100.0
+
+# ==========================================
+# 5. MAIN VISUALIZATION
+# ==========================================
+source_corrected, sink_smoothed = analyzer.get_corrected_data(gain, lag, smoothing)
+diff = source_corrected - sink_smoothed
+
+# Top Metrics
+c1, c2, c3 = st.columns(3)
+with c1: st.metric("Total Sink Volume", f"{sink_smoothed.sum()/1e6:.2f} M")
+with c2: st.metric("Total Source (Adj)", f"{source_corrected.sum()/1e6:.2f} M")
+with c3: 
+    balance_err = (source_corrected.sum() - sink_smoothed.sum()) / sink_smoothed.sum() * 100 if sink_smoothed.sum() != 0 else 0
+    st.metric("Net Imbalance", f"{balance_err:.2f} %", delta_color="inverse")
+
+if anomalies:
+    st.warning(f"⚠️ BURST/ANOMALY DETECTED (Index {min(anomalies)} - {max(anomalies)})")
+
+tab1, tab2, tab3 = st.tabs(["Forensic View", "Raw Data", "Meeting Points (Export)"])
+
+with tab1:
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.7, 0.3],
+                        subplot_titles=("Flow Rate Comparison", "Residual Analysis"))
+
+    # Main Plot
+    fig.add_trace(go.Scatter(x=df.index, y=sink_smoothed, mode='lines', 
+                             name=f'Sink ({sink_col})', line=dict(color='#ff7f0e')), row=1, col=1) # Plotly Orange
+    fig.add_trace(go.Scatter(x=df.index, y=source_corrected, mode='lines', 
+                             name=f'Source ({source_col})', line=dict(color='#1f77b4')), row=1, col=1) # Plotly Blue
+
+    # Residuals
+    fig.add_trace(go.Scatter(x=df.index, y=diff, mode='lines', name='Delta', 
+                             line=dict(color='gray')), row=2, col=1)
+    fig.add_trace(go.Scatter(x=df.index, y=diff, fill='tozeroy', mode='none', 
+                             fillcolor='rgba(255, 0, 0, 0.2)', showlegend=False), row=2, col=1)
+    
+    # NEW: Add a zero-line to residuals to easily see balance
+    fig.add_hline(y=0, line_dash="dash", line_color="black", opacity=0.5, row=2, col=1)
+
+    if anomalies:
+        fig.add_vrect(x0=min(anomalies), x1=max(anomalies), 
+                      fillcolor="red", opacity=0.15, layer="below")
+
+    fig.update_layout(height=600, hovermode="x unified", margin=dict(t=40, b=20))
+    st.plotly_chart(fig, use_container_width=True)
+
+with tab2:
+    st.dataframe(df, use_container_width=True)
+
+with tab3:
+    st.markdown("### 1. Aggregated Meeting Points")
+    st.write(f"Showing times where the total calibrated source is within **{tolerance_pct*100:.2f}%** of the total sink.")
+    
+    is_meeting = abs(diff) <= (abs(sink_smoothed) * tolerance_pct)
+    meeting_times = df.index[is_meeting].tolist() 
+    
+    meeting_df = pd.DataFrame({
+        'Time_Index': meeting_times,
+        'Calibrated_Source': source_corrected[is_meeting].round(2),
+        'Smoothed_Sink': sink_smoothed[is_meeting].round(2),
+        'Difference': diff[is_meeting].round(2)
+    })
+    
+    if meeting_df.empty:
+        st.warning("No meeting points found with current calibration and tolerance settings.")
+    else:
+        st.dataframe(meeting_df, use_container_width=True)
+        
+        st.divider()
+        st.markdown("### 2. Export Filtered & Calibrated Node History")
+        
+        required_cols = ['Sources/Sinks', 'NAME', 'Time (Hr)', 'Water Q (STB)']
+        
+        if all(col in raw_full_df.columns for col in required_cols):
+            calibrated_raw_df = calibrate_raw_detailed_data(raw_full_df, gain, int(lag), pressure_offset, meeting_times)
+            st.dataframe(calibrated_raw_df, use_container_width=True) 
+            
+            st.download_button(
+                label="Download Calibrated Node History (CSV)",
+                data=calibrated_raw_df.to_csv(index=False).encode('utf-8'),
+                file_name='calibrated_meeting_nodes.csv',
+                mime='text/csv',
+                type='primary'
+            )
+        else:
+            st.warning(f"Detailed export requires columns: `{', '.join(required_cols)}`. Ensure your uploaded CSV contains these headers.")
+
+# ==========================================
+# 6. DIAGNOSTIC EXPLANATION
+# ==========================================
+st.divider()
+with st.expander("How to interpret this analysis"):
+    st.markdown("""
+    1.  **Calibration Error:** If the *Blue* and *Orange* lines have the same shape but different heights, adjust the **Calibration Factor** until they overlap. The `Suggested Gain` calculates this for you.
+    2.  **Timing Mismatch:** If the peaks are misaligned, adjust the **Lag Slider**.
+    3.  **Pressure Offset:** Use the new control to dial in your field gauges.
+    4.  **Leaks/Bursts:** Look at the bottom chart (Residuals).
+        * **Flat Line @ 0:** Perfect balance.
+        * **Negative Dip (Red):** Potential Leak or Burst.
+        * **Positive Spike:** Tank filling or sensor error.
+    """)
