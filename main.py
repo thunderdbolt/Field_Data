@@ -28,13 +28,25 @@ class ForensicFlowAnalyzer:
         return self.anomalies
 
     def get_auto_calibration_factor(self) -> float:
-        # Using MEDIAN instead of SUM to ignore massive spikes/drops
         clean_df = self.df[~self.df['is_anomaly']]
         
-        median_source = clean_df[self.source_col].median()
-        median_sink = clean_df[self.sink_col].median()
+        # 1. Find the 10th and 90th percentiles for both lines
+        src_q_low, src_q_high = clean_df[self.source_col].quantile([0.1, 0.9])
+        snk_q_low, snk_q_high = clean_df[self.sink_col].quantile([0.1, 0.9])
         
-        return median_sink / median_source if median_source != 0 else 1.0
+        # 2. Filter out the extremes (Dropouts and Spikes)
+        valid_sources = clean_df[(clean_df[self.source_col] > src_q_low) & 
+                                 (clean_df[self.source_col] < src_q_high)][self.source_col]
+                                 
+        valid_sinks = clean_df[(clean_df[self.sink_col] > snk_q_low) & 
+                               (clean_df[self.sink_col] < snk_q_high)][self.sink_col]
+        
+        # 3. Calculate the mean of the stable, middle data
+        stable_source_mean = valid_sources.mean()
+        stable_sink_mean = valid_sinks.mean()
+        
+        # Prevent division by zero just in case
+        return stable_sink_mean / stable_source_mean if pd.notnull(stable_source_mean) and stable_source_mean != 0 else 1.0
 
     def get_optimal_lag(self, max_lag: int = 20) -> int:
         clean_df = self.df[~self.df['is_anomaly']].fillna(0)
