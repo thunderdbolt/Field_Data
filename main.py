@@ -76,7 +76,7 @@ class ForensicFlowAnalyzer:
         else:
             sink_smoothed = self.df[self.sink_col]
             
-        return source_corrected, sink_smoothedk_smoothed
+        return source_corrected, sink_smoothed
 
 # --- CALIBRATION & STACKING FUNCTION ---
 @st.cache_data
