@@ -28,18 +28,31 @@ class ForensicFlowAnalyzer:
         return self.anomalies
 
     def get_auto_calibration_factor(self) -> float:
+        # Using MEDIAN instead of SUM to ignore massive spikes/drops
         clean_df = self.df[~self.df['is_anomaly']]
-        total_source = clean_df[self.source_col].sum()
-        total_sink = clean_df[self.sink_col].sum()
-        return total_sink / total_source if total_source != 0 else 1.0
+        
+        median_source = clean_df[self.source_col].median()
+        median_sink = clean_df[self.sink_col].median()
+        
+        return median_sink / median_source if median_source != 0 else 1.0
 
     def get_optimal_lag(self, max_lag: int = 20) -> int:
         clean_df = self.df[~self.df['is_anomaly']].fillna(0)
-        source = clean_df[self.source_col]
-        sink = clean_df[self.sink_col]
         
-        correlations = [source.shift(lag).fillna(0).corr(sink) for lag in range(-max_lag, max_lag + 1)]
-        return range(-max_lag, max_lag + 1)[np.argmax(correlations)]
+        # PRE-SMOOTH the data to remove jitter before correlating
+        # A rolling median of 5 helps flatten out single-point spikes
+        source_smoothed = clean_df[self.source_col].rolling(window=5, min_periods=1).median()
+        sink_smoothed = clean_df[self.sink_col].rolling(window=5, min_periods=1).median()
+        
+        correlations = []
+        lags = range(-max_lag, max_lag + 1)
+        
+        for lag in lags:
+            s_shifted = source_smoothed.shift(lag).fillna(0)
+            # Use 'spearman' correlation which evaluates trend, ignoring magnitude outliers
+            correlations.append(s_shifted.corr(sink_smoothed, method='spearman'))
+        
+        return lags[np.argmax(correlations)]
 
     def get_corrected_data(self, gain: float = 1.0, lag: int = 0, smoothing: int = 1) -> Tuple[pd.Series, pd.Series]:
         source_corrected = self.df[self.source_col].shift(lag) * gain
