@@ -58,20 +58,23 @@ class ForensicFlowAnalyzer:
         return source_corrected, sink_smoothed
 
 # --- CALIBRATION & STACKING FUNCTION ---
-def calibrate_raw_detailed_data(raw_df, gain, lag, meeting_times):
+def calibrate_raw_detailed_data(raw_df, gain, lag, pressure_offset, meeting_times):
     # 1. Extract the Source columns (left side of your CSV)
-    # We use errors='ignore' in case some columns are missing
     source_cols = ['Sources/Sinks', 'NAME', 'Time (Hr)', 'Water Q (STB)', 'Pressure (psig)']
     source_cols_present = [c for c in source_cols if c in raw_df.columns]
     
     sources_df = raw_df[source_cols_present].copy()
-    sources_df = sources_df.dropna(subset=['Sources/Sinks']) # Clean empty bottom rows
+    sources_df = sources_df.dropna(subset=['Sources/Sinks']) 
     
-    # Apply Gain and Lag to Sources only
+    # Apply Gain, Lag, and Pressure Offset to Sources only
+    is_source = sources_df['Sources/Sinks'].str.lower() == 'source'
+    
     if 'Water Q (STB)' in sources_df.columns and 'Time (Hr)' in sources_df.columns:
-        is_source = sources_df['Sources/Sinks'].str.lower() == 'source'
         sources_df.loc[is_source, 'Water Q (STB)'] = pd.to_numeric(sources_df.loc[is_source, 'Water Q (STB)'], errors='coerce') * gain
         sources_df.loc[is_source, 'Time (Hr)'] = pd.to_numeric(sources_df.loc[is_source, 'Time (Hr)'], errors='coerce') + lag
+        
+    if 'Pressure (psig)' in sources_df.columns:
+        sources_df.loc[is_source, 'Pressure (psig)'] = pd.to_numeric(sources_df.loc[is_source, 'Pressure (psig)'], errors='coerce') + pressure_offset
     
     # Filter for Meeting Times
     filtered_sources = sources_df[sources_df['Time (Hr)'].isin(meeting_times)]
@@ -82,21 +85,36 @@ def calibrate_raw_detailed_data(raw_df, gain, lag, meeting_times):
         sink_cols_present = [c for c in sink_cols if c in raw_df.columns]
         sinks_df = raw_df[sink_cols_present].copy()
         
-        # Rename them so they stack perfectly under the sources
         rename_dict = {f"{c}.1": c for c in source_cols}
         sinks_df.rename(columns=rename_dict, inplace=True)
         sinks_df = sinks_df.dropna(subset=['Sources/Sinks'])
         
-        # Filter Sinks for Meeting Times (no lag/gain applied to sinks)
         filtered_sinks = sinks_df[pd.to_numeric(sinks_df['Time (Hr)'], errors='coerce').isin(meeting_times)]
         
         # 3. Stack them vertically!
         final_df = pd.concat([filtered_sources, filtered_sinks])
     else:
         final_df = filtered_sources
+
+    # --- NEW: AGGREGATE DUPLICATES UPSTREAM ---
+    if 'Water Q (STB)' in final_df.columns:
+        final_df['Water Q (STB)'] = pd.to_numeric(final_df['Water Q (STB)'], errors='coerce').fillna(0)
+    if 'Pressure (psig)' in final_df.columns:
+        final_df['Pressure (psig)'] = pd.to_numeric(final_df['Pressure (psig)'], errors='coerce').fillna(0)
+
+    # Group by the identifiers and apply math to the values
+    group_cols = [c for c in ['Sources/Sinks', 'NAME', 'Time (Hr)'] if c in final_df.columns]
+    agg_dict = {}
+    if 'Water Q (STB)' in final_df.columns:
+        agg_dict['Water Q (STB)'] = 'sum'
+    if 'Pressure (psig)' in final_df.columns:
+        agg_dict['Pressure (psig)'] = 'mean'
+
+    if agg_dict:
+        final_df = final_df.groupby(group_cols, as_index=False).agg(agg_dict)
+    # ------------------------------------------
         
     return final_df.sort_values(by=['Time (Hr)', 'Sources/Sinks', 'NAME'])
-
 
 # ==========================================
 # 2. STREAMLIT UI SETUP
@@ -188,6 +206,11 @@ with st.sidebar:
     gain = st.number_input("Calibration Factor", 0.0, 5.0, 
                            value=st.session_state.get('gain_val', 1.00), step=0.01, format="%.3f")
 
+    # --- RE-ADDED PRESSURE OFFSET CONTROL ---
+    pressure_offset = st.number_input("Pressure Offset (psig)", -500.0, 500.0, 
+                                      value=0.0, step=5.0, 
+                                      help="Adds or subtracts a flat value to source pressures to account for sensor zero-drift or elevation.")
+
     st.divider()
     smoothing = st.slider("Smoothing Window", 1, 20, 1)
     
@@ -272,7 +295,8 @@ with tab3:
         
         if all(col in raw_full_df.columns for col in required_cols):
             
-            calibrated_raw_df = calibrate_raw_detailed_data(raw_full_df, gain, int(lag), meeting_times)
+            # --- FIXED: Added pressure_offset to the function call! ---
+            calibrated_raw_df = calibrate_raw_detailed_data(raw_full_df, gain, int(lag), pressure_offset, meeting_times)
             
             st.dataframe(calibrated_raw_df, use_container_width=True) 
             
@@ -295,7 +319,8 @@ with st.expander("How to interpret this analysis"):
     st.markdown("""
     1.  **Calibration Error:** If the *Blue* and *Orange* lines have the same shape but different heights, adjust the **Calibration Factor** until they overlap. The `Suggested Gain` calculates this for you.
     2.  **Timing Mismatch:** If the peaks are misaligned, adjust the **Lag Slider**.
-    3.  **Leaks/Bursts:** Look at the bottom chart (Residuals).
+    3.  **Pressure Offset:** Use the new control to dial in your field gauges.
+    4.  **Leaks/Bursts:** Look at the bottom chart (Residuals).
         * **Flat Line @ 0:** Perfect balance.
         * **Negative Dip (Red):** Potential Leak or Burst.
         * **Positive Spike:** Tank filling or sensor error.
