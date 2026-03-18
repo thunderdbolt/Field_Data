@@ -192,15 +192,15 @@ with st.sidebar:
 # ==========================================
 # 4. EXECUTION
 # ==========================================
-file_id = uploaded_file.name
-
 if uploaded_file:
-    if run_engine or 'processed_df' not in st.session_state or st.session_state.get('current_file') != file_id:
-        reconciler = PipelineDataReconciler(df, 'Source_Q', 'Sink_Q', 'Source_P', 'Sink_P')
-        reconciler.clean_and_stitch_sinks()
-        lag = reconciler.align_time_lag()
-        mdf = reconciler.segment_calibration(dt=dt_size)
-        st.session_state.update({'processed_df': reconciler.df, 'metrics_df': mdf, 'lag': lag, 'current_file': file_id})
+    file_id = uploaded_file.name
+
+if run_engine or 'processed_df' not in st.session_state or st.session_state.get('current_file') != file_id:
+    reconciler = PipelineDataReconciler(df, 'Source_Q', 'Sink_Q', 'Source_P', 'Sink_P')
+    reconciler.clean_and_stitch_sinks()
+    lag = reconciler.align_time_lag()
+    mdf = reconciler.segment_calibration(dt=dt_size)
+    st.session_state.update({'processed_df': reconciler.df, 'metrics_df': mdf, 'lag': lag, 'current_file': file_id})
 
 pdf, mdf = st.session_state['processed_df'], st.session_state['metrics_df']
 
