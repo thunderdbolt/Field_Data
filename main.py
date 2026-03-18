@@ -3,323 +3,270 @@ import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-from typing import List, Tuple
 
 # ==========================================
 # 1. FORENSIC LOGIC ENGINE
 # ==========================================
-class ForensicFlowAnalyzer:
-    def __init__(self, df: pd.DataFrame, source_col: str, sink_col: str):
+class PipelineDataReconciler:
+    def __init__(self, df: pd.DataFrame, source_q: str, sink_q: str, source_p: str = None, sink_p: str = None):
         self.df = df.copy()
-        self.source_col = source_col
-        self.sink_col = sink_col
-        self.anomalies = []
+        
+        # 1. STRICT OVERLAP BOUNDING BOX
+        valid_src = self.df[self.df[source_q].notnull()].index
+        valid_snk = self.df[self.df[sink_q].notnull()].index
+        
+        if len(valid_src) > 0 and len(valid_snk) > 0:
+            start_idx = max(valid_src.min(), valid_snk.min())
+            end_idx = min(valid_src.max(), valid_snk.max())
+            self.df = self.df.loc[start_idx:end_idx].reset_index(drop=True)
+        
+        self.source_q = source_q
+        self.sink_q = sink_q
+        self.source_p = source_p
+        self.sink_p = sink_p
+        self.df['Reconciled_Source_Q'] = self.df[self.source_q]
+        self.df['Active_Gain'] = 1.0
+        self.df['Trust_Score'] = 'N/A'
 
-    def detect_anomalies(self, threshold_std: float = 3.0, window: int = 10) -> List[int]:
-        self.df['diff'] = self.df[self.source_col] - self.df[self.sink_col]
-        rolling_mean = self.df['diff'].rolling(window=window).mean()
-        rolling_std = self.df['diff'].rolling(window=window).std()
+    def clean_and_stitch_sinks(self, spike_threshold: float = 3.0, window: int = 5):
+        rolling_median = self.df[self.sink_q].rolling(window, center=True, min_periods=1).median()
+        mad = (self.df[self.sink_q] - rolling_median).abs().rolling(window, center=True, min_periods=1).median()
         
-        upper_bound = rolling_mean + (threshold_std * rolling_std)
-        lower_bound = rolling_mean - (threshold_std * rolling_std)
-        
-        self.df['is_anomaly'] = (self.df['diff'] > upper_bound) | (self.df['diff'] < lower_bound)
-        self.anomalies = self.df[self.df['is_anomaly']].index.tolist()
-        return self.anomalies
+        is_high_peak = (self.df[self.sink_q] - rolling_median) > (spike_threshold * mad)
+        self.df.loc[is_high_peak, self.sink_q] = np.nan
+        self.df[self.sink_q] = self.df[self.sink_q].interpolate(method='linear')
+        return self
 
-    def get_auto_calibration_factor(self) -> float:
-        clean_df = self.df[~self.df['is_anomaly']]
-        
-        # 1. Find the 10th and 90th percentiles for both lines
-        src_q_low, src_q_high = clean_df[self.source_col].quantile([0.1, 0.9])
-        snk_q_low, snk_q_high = clean_df[self.sink_col].quantile([0.1, 0.9])
-        
-        # 2. Filter out the extremes (Dropouts and Spikes)
-        valid_sources = clean_df[(clean_df[self.source_col] > src_q_low) & 
-                                 (clean_df[self.source_col] < src_q_high)][self.source_col]
-                                 
-        valid_sinks = clean_df[(clean_df[self.sink_col] > snk_q_low) & 
-                               (clean_df[self.sink_col] < snk_q_high)][self.sink_col]
-        
-        # 3. Calculate the mean of the stable, middle data
-        stable_source_mean = valid_sources.mean()
-        stable_sink_mean = valid_sinks.mean()
-        
-        # Prevent division by zero just in case
-        return stable_sink_mean / stable_source_mean if pd.notnull(stable_source_mean) and stable_source_mean != 0 else 1.0
+    def align_time_lag(self, max_lag: int = 20):
+        smooth_source = self.df[self.source_q].rolling(3, min_periods=1).mean()
+        smooth_sink = self.df[self.sink_q].rolling(3, min_periods=1).mean()
 
-    def get_optimal_lag(self, max_lag: int = 20) -> int:
-        clean_df = self.df[~self.df['is_anomaly']].fillna(0)
+        correlations = [smooth_source.shift(lag).corr(smooth_sink) for lag in range(-max_lag, max_lag + 1)]
+        best_lag = range(-max_lag, max_lag + 1)[np.nanargmax(correlations)]
         
-        # PRE-SMOOTH the data to remove jitter before correlating
-        # A rolling median of 5 helps flatten out single-point spikes
-        source_smoothed = clean_df[self.source_col].rolling(window=5, min_periods=1).median()
-        sink_smoothed = clean_df[self.sink_col].rolling(window=5, min_periods=1).median()
-        
-        correlations = []
-        lags = range(-max_lag, max_lag + 1)
-        
-        for lag in lags:
-            s_shifted = source_smoothed.shift(lag).fillna(0)
-            # Use 'spearman' correlation which evaluates trend, ignoring magnitude outliers
-            correlations.append(s_shifted.corr(sink_smoothed, method='spearman'))
-        
-        return lags[np.argmax(correlations)]
+        self.df['Reconciled_Source_Q'] = self.df['Reconciled_Source_Q'].shift(best_lag).bfill().ffill()
+        return best_lag
 
-    def get_corrected_data(self, gain: float = 1.0, lag: int = 0, smoothing: int = 1) -> Tuple[pd.Series, pd.Series]:
-        source_corrected = self.df[self.source_col].shift(lag) * gain
+    def segment_calibration(self, dt: int):
+        segment_metrics = []
+        col_idx_q = self.df.columns.get_loc('Reconciled_Source_Q')
+        col_idx_g = self.df.columns.get_loc('Active_Gain')
+        col_idx_t = self.df.columns.get_loc('Trust_Score')
         
-        if smoothing > 1:
-            # Changed from .mean() to .median() for aggressive spike removal
-            source_corrected = source_corrected.rolling(window=smoothing, center=True, min_periods=1).median()
-            sink_smoothed = self.df[self.sink_col].rolling(window=smoothing, center=True, min_periods=1).median()
-        else:
-            sink_smoothed = self.df[self.sink_col]
+        for start_idx in range(0, len(self.df), dt):
+            end_idx = min(start_idx + dt, len(self.df))
+            chunk = self.df.iloc[start_idx:end_idx]
             
-        return source_corrected, sink_smoothed
-
-# --- CALIBRATION & STACKING FUNCTION ---
-@st.cache_data
-def calibrate_raw_detailed_data(raw_df: pd.DataFrame, gain: float, lag: int, pressure_offset: float, meeting_times: list):
-    """Processes granular source/sink node data based on aggregated meeting times."""
-    source_cols = ['Sources/Sinks', 'NAME', 'Time (Hr)', 'Water Q (STB)', 'Pressure (psig)']
-    source_cols_present = [c for c in source_cols if c in raw_df.columns]
-    
-    sources_df = raw_df[source_cols_present].dropna(subset=['Sources/Sinks']).copy()
-    is_source = sources_df['Sources/Sinks'].str.lower() == 'source'
-    
-    # Apply Corrections safely using .loc
-    if 'Water Q (STB)' in sources_df.columns and 'Time (Hr)' in sources_df.columns:
-        sources_df.loc[is_source, 'Water Q (STB)'] = pd.to_numeric(sources_df.loc[is_source, 'Water Q (STB)'], errors='coerce') * gain
-        sources_df.loc[is_source, 'Time (Hr)'] = pd.to_numeric(sources_df.loc[is_source, 'Time (Hr)'], errors='coerce') + lag
-        
-    if 'Pressure (psig)' in sources_df.columns:
-        sources_df.loc[is_source, 'Pressure (psig)'] = pd.to_numeric(sources_df.loc[is_source, 'Pressure (psig)'], errors='coerce') + pressure_offset
-    
-    filtered_sources = sources_df[sources_df['Time (Hr)'].isin(meeting_times)]
-    
-    # Process Sinks (assuming .1 suffix structure from specific export tool)
-    if 'Sources/Sinks.1' in raw_df.columns:
-        sink_cols_present = [f"{c}.1" for c in source_cols if f"{c}.1" in raw_df.columns]
-        sinks_df = raw_df[sink_cols_present].dropna(subset=['Sources/Sinks.1']).copy()
-        sinks_df.rename(columns={f"{c}.1": c for c in source_cols}, inplace=True)
-        
-        filtered_sinks = sinks_df[pd.to_numeric(sinks_df['Time (Hr)'], errors='coerce').isin(meeting_times)]
-        final_df = pd.concat([filtered_sources, filtered_sinks])
-    else:
-        final_df = filtered_sources
-
-    # Aggregate Duplicates
-    if 'Water Q (STB)' in final_df.columns:
-        final_df['Water Q (STB)'] = pd.to_numeric(final_df['Water Q (STB)'], errors='coerce').fillna(0)
-    if 'Pressure (psig)' in final_df.columns:
-        final_df['Pressure (psig)'] = pd.to_numeric(final_df['Pressure (psig)'], errors='coerce').fillna(0)
-
-    group_cols = [c for c in ['Sources/Sinks', 'NAME', 'Time (Hr)'] if c in final_df.columns]
-    agg_dict = {col: 'sum' if col == 'Water Q (STB)' else 'mean' for col in ['Water Q (STB)', 'Pressure (psig)'] if col in final_df.columns}
-
-    if agg_dict:
-        final_df = final_df.groupby(group_cols, as_index=False).agg(agg_dict)
-        
-    return final_df.sort_values(by=['Time (Hr)', 'Sources/Sinks', 'NAME'])
-
+            sum_sink = chunk[self.sink_q].sum()
+            sum_source = chunk['Reconciled_Source_Q'].sum()
+            local_gain = sum_sink / sum_source if sum_source != 0 else 1.0
+            
+            self.df.iloc[start_idx:end_idx, col_idx_q] *= local_gain
+            self.df.iloc[start_idx:end_idx, col_idx_g] = local_gain
+            
+            avg_dp, trust_score = np.nan, "N/A"
+            if self.source_p and self.sink_p:
+                chunk_dp = chunk[self.source_p] - chunk[self.sink_p]
+                chunk_q = self.df.iloc[start_idx:end_idx, col_idx_q] 
+                avg_dp = chunk_dp.mean()
+                
+                if chunk_q.std() > 0 and chunk_dp.std() > 0:
+                    corr = chunk_q.corr(chunk_dp, method='spearman')
+                    if corr >= 0.4: trust_score = "🟢 High (Physics Align)"
+                    elif corr >= 0: trust_score = "🟡 Low (Noisy)"
+                    else: trust_score = "🔴 FAIL (Inverse Physics)"
+                else: trust_score = "⚪ Static"
+            
+            self.df.iloc[start_idx:end_idx, col_idx_t] = trust_score
+                
+            segment_metrics.append({
+                'Start Time': chunk.index.min(),
+                'End Time': chunk.index.max(),
+                'Local Gain': round(local_gain, 4),
+                'Avg Delta P (psi)': round(avg_dp, 2) if pd.notna(avg_dp) else None,
+                'Trust Score': trust_score
+            })
+            
+        return pd.DataFrame(segment_metrics)
 
 # ==========================================
-# 2. DATA LOADING & GENERATION
+# 2. DATA PRE-PROCESSORS & FORMATTERS
 # ==========================================
 @st.cache_data
-def load_data(uploaded_file):
-    return pd.read_csv(uploaded_file)
+def preprocess_field_data(raw_df):
+    try:
+        src_cols = ['Time (Hr)', 'Water Q (STB)', 'Pressure (psig)']
+        src_df = raw_df[src_cols].dropna()
+        src_agg = src_df.groupby('Time (Hr)').agg({'Water Q (STB)':'sum', 'Pressure (psig)':'mean'}).reset_index()
+        src_agg.columns = ['Time', 'Source_Q', 'Source_P']
+        
+        snk_cols = ['Time (Hr).1', 'Water Q (STB).1', 'Pressure (psig).1']
+        snk_df = raw_df[snk_cols].dropna()
+        snk_agg = snk_df.groupby('Time (Hr).1').agg({'Water Q (STB).1':'sum', 'Pressure (psig).1':'mean'}).reset_index()
+        snk_agg.columns = ['Time', 'Sink_Q', 'Sink_P']
+        
+        aligned_df = pd.merge(src_agg, snk_agg, on='Time', how='inner').set_index('Time')
+        return aligned_df
+    except Exception: return None
 
-@st.cache_data # CRITICAL FIX: Caching prevents data from regenerating on slider moves
-def generate_demo_data():
-    np.random.seed(42)
-    steps = 350
-    base = np.random.normal(140000, 5000, steps)
-    sink = base + np.random.normal(0, 2000, steps)
-    source = (base * 0.85) + np.random.normal(0, 2000, steps)
-    source[328:] = source[328:] * 1.5 
-    sink[328:] = sink[328:] * 0.6
-    return pd.DataFrame({'Source': source, 'Sink': sink})
+@st.cache_data
+def generate_granular_node_export(raw_df: pd.DataFrame, metrics_df: pd.DataFrame) -> pd.DataFrame:
+    try:
+        src_cols = ['Sources/Sinks', 'NAME', 'Time (Hr)', 'Water Q (STB)', 'Pressure (psig)']
+        sources = raw_df[src_cols].dropna(subset=['NAME']).copy()
+        sources.columns = ['Type', 'Node_Name', 'Time', 'Original_Q', 'Pressure']
+        
+        snk_cols = ['Sources/Sinks.1', 'NAME.1', 'Time (Hr).1', 'Water Q (STB).1', 'Pressure (psig).1']
+        sinks = raw_df[snk_cols].dropna(subset=['NAME.1']).copy()
+        sinks.columns = ['Type', 'Node_Name', 'Time', 'Original_Q', 'Pressure']
+        
+        sources['Reconciled_Q'], sources['Applied_Gain'] = sources['Original_Q'], 1.0
+        sinks['Reconciled_Q'], sinks['Applied_Gain'] = sinks['Original_Q'], 1.0
+        
+        for _, row in metrics_df.iterrows():
+            mask = (sources['Time'] >= row['Start Time']) & (sources['Time'] <= row['End Time'])
+            sources.loc[mask, 'Applied_Gain'] = row['Local Gain']
+            sources.loc[mask, 'Reconciled_Q'] = sources.loc[mask, 'Original_Q'] * row['Local Gain']
+            
+        return pd.concat([sources, sinks], ignore_index=True).sort_values(by=['Time', 'Type', 'Node_Name']).reset_index(drop=True)
+    except Exception: return pd.DataFrame()
 
+@st.cache_data
+def prep_pipesim_batch_cases(reconciled_df: pd.DataFrame, num_cases: int = 50, exclude_fails: bool = True):
+    df = reconciled_df.copy()
+    if exclude_fails and 'Trust_Score' in df.columns:
+        df = df[~df['Trust_Score'].str.contains("FAIL", na=False)]
+    
+    df['Flow_Volatility'] = df['Reconciled_Source_Q'].rolling(window=5).std()
+    stable_df = df[df['Flow_Volatility'] <= df['Flow_Volatility'].quantile(0.75)].copy()
+    stable_df = stable_df.sort_values(by='Reconciled_Source_Q')
+    
+    actual_num = min(len(stable_df), num_cases)
+    indices = np.linspace(0, len(stable_df) - 1, actual_num, dtype=int)
+    batch_cases = stable_df.iloc[indices].copy()
+    
+    # Map back to Time indices for the granular extraction
+    return batch_cases.index.tolist(), batch_cases
 
 # ==========================================
-# 3. STREAMLIT UI & STATE SETUP
+# 3. STREAMLIT UI SETUP
 # ==========================================
 st.set_page_config(page_title="Forensic Flow Workspace", layout="wide")
-st.title("Forensic Flow Analyzer")
-
-# Initialize Session States
-if 'lag_val' not in st.session_state: st.session_state['lag_val'] = 0
-if 'gain_val' not in st.session_state: st.session_state['gain_val'] = 1.00
+st.title("Forensic Flow Analyzer & Data Reconciler")
 
 with st.sidebar:
     st.header("1. Data Input")
     uploaded_file = st.file_uploader("Upload CSV", type=['csv'])
-    use_demo = st.checkbox("Use Demo Data", value=(uploaded_file is None))
-
-    df, raw_full_df = None, None
-    source_col, sink_col = 'Source', 'Sink'
-
-    if uploaded_file:
-        df = load_data(uploaded_file)
-        raw_full_df = df.copy()
-        
-        st.subheader("Map Columns")
-        all_cols = df.columns.tolist()
-        source_col = st.selectbox("Select Source Column", all_cols, index=0)
-        sink_col = st.selectbox("Select Sink Column", all_cols, index=1 if len(all_cols) > 1 else 0)
-        
-    elif use_demo:
-        df = generate_demo_data()
-        raw_full_df = df.copy()
-
-    # Early exit if no data
-    if df is None:
-        st.info("Please upload a CSV or select Demo Data to begin.")
-        st.stop()
-
-    try:
-        # Prepare the dataframe
-        df[source_col] = pd.to_numeric(df[source_col], errors='coerce')
-        df[sink_col] = pd.to_numeric(df[sink_col], errors='coerce')
-        df = df.dropna(subset=[source_col, sink_col])
-
-        analyzer = ForensicFlowAnalyzer(df, source_col, sink_col)
-        anomalies = analyzer.detect_anomalies()
-        suggested_lag = analyzer.get_optimal_lag()
-        suggested_gain = analyzer.get_auto_calibration_factor()
-    except Exception as e:
-        st.error(f"Error processing data mapping: {e}")
-        st.stop()
-
-# ==========================================
-# 4. FORENSIC CONTROLS
-# ==========================================
-with st.sidebar:
-    st.divider()
-    st.header("2. Forensic Controls")
     
-    st.subheader("Time Alignment")
-    st.info(f"Detected Lag: **{suggested_lag} units**")
-    if st.button("Apply Auto-Lag", use_container_width=True):
-        st.session_state['lag_val'] = int(suggested_lag)
+    source_q_col, sink_q_col = 'Source_Q', 'Sink_Q'
+    source_p_col, sink_p_col = 'Source_P', 'Sink_P'
+    has_pressure = True
+    raw_df = None
+    
+    if not uploaded_file:
+        np.random.seed(42)
+        steps = 335
+        base = np.random.normal(140000, 5000, steps)
+        df = pd.DataFrame({
+            'Source_Q': (base * 0.85) + np.random.normal(0, 2000, steps), 
+            'Sink_Q': base + np.random.normal(0, 2000, steps), 
+            'Source_P': np.random.normal(150, 10, steps), 
+            'Sink_P': np.random.normal(100, 5, steps)
+        })
+        st.info("Using Demo Data. Upload your Wide CSV to unlock granular exports.")
+    else:
+        raw_df = pd.read_csv(uploaded_file)
+        df = preprocess_field_data(raw_df)
         
-    lag = st.slider("Manual Lag Adjustment", -20, 20, key='lag_val')
-
-    st.subheader("Meter Calibration")
-    st.info(f"Suggested Gain: **{suggested_gain:.3f}**")
-    if st.button("Apply Auto-Calibration", use_container_width=True):
-        st.session_state['gain_val'] = float(suggested_gain)
-
-    gain = st.number_input("Calibration Factor", 0.0, 5.0, step=0.01, format="%.3f", key='gain_val')
-
-    pressure_offset = st.number_input("Pressure Offset (psig)", -500.0, 500.0, value=0.0, step=5.0, 
-                                      help="Accounts for sensor zero-drift or elevation.")
+        if df is not None:
+            st.success("Wide CSV successfully parsed and aggregated!")
+        else:
+            st.error("Could not parse columns. Ensure your CSV has the standard output format.")
+            st.stop()
 
     st.divider()
-    smoothing = st.slider("Smoothing Window", 1, 20, 1)
-    
-    st.subheader("Meeting Points Criteria")
-    tolerance_pct = st.slider("Tolerance %", 0.0, 10.0, 0.32, step=0.01) / 100.0
+    st.header("⚙️ Calibration Engine")
+    dt_size = st.number_input("Calibration Window (dt)", min_value=1, value=10, step=1)
+    run_engine = st.button("🚀 Run Reconciliation Engine", type="primary", use_container_width=True)
 
 # ==========================================
-# 5. MAIN VISUALIZATION
+# 4. EXECUTION
 # ==========================================
-source_corrected, sink_smoothed = analyzer.get_corrected_data(gain, lag, smoothing)
-diff = source_corrected - sink_smoothed
+file_id = uploaded_file.name
+if run_engine or 'processed_df' not in st.session_state or st.session_state.get('current_file') != file_id:
+    reconciler = PipelineDataReconciler(df, 'Source_Q', 'Sink_Q', 'Source_P', 'Sink_P')
+    reconciler.clean_and_stitch_sinks()
+    lag = reconciler.align_time_lag()
+    mdf = reconciler.segment_calibration(dt=dt_size)
+    st.session_state.update({'processed_df': reconciler.df, 'metrics_df': mdf, 'lag': lag, 'current_file': file_id})
 
-# Top Metrics
-c1, c2, c3 = st.columns(3)
-with c1: st.metric("Total Sink Volume", f"{sink_smoothed.sum()/1e6:.2f} M")
-with c2: st.metric("Total Source (Adj)", f"{source_corrected.sum()/1e6:.2f} M")
-with c3: 
-    balance_err = (source_corrected.sum() - sink_smoothed.sum()) / sink_smoothed.sum() * 100 if sink_smoothed.sum() != 0 else 0
-    st.metric("Net Imbalance", f"{balance_err:.2f} %", delta_color="inverse")
+pdf, mdf = st.session_state['processed_df'], st.session_state['metrics_df']
 
-if anomalies:
-    st.warning(f"⚠️ BURST/ANOMALY DETECTED (Index {min(anomalies)} - {max(anomalies)})")
+# Tabs
+t1, t2, t3, t4 = st.tabs(["Visual Diagnostics", "Segmented Regime Map", "Granular Node Export", "PIPESIM Batch Export"])
 
-tab1, tab2, tab3 = st.tabs(["Forensic View", "Raw Data", "Meeting Points (Export)"])
-
-with tab1:
-    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.7, 0.3],
-                        subplot_titles=("Flow Rate Comparison", "Residual Analysis"))
-
-    # Main Plot
-    fig.add_trace(go.Scatter(x=df.index, y=sink_smoothed, mode='lines', 
-                             name=f'Sink ({sink_col})', line=dict(color='#ff7f0e')), row=1, col=1) # Plotly Orange
-    fig.add_trace(go.Scatter(x=df.index, y=source_corrected, mode='lines', 
-                             name=f'Source ({source_col})', line=dict(color='#1f77b4')), row=1, col=1) # Plotly Blue
-
-    # Residuals
-    fig.add_trace(go.Scatter(x=df.index, y=diff, mode='lines', name='Delta', 
-                             line=dict(color='gray')), row=2, col=1)
-    fig.add_trace(go.Scatter(x=df.index, y=diff, fill='tozeroy', mode='none', 
-                             fillcolor='rgba(255, 0, 0, 0.2)', showlegend=False), row=2, col=1)
+with t1:
+    fig_rows = 3 if has_pressure else 2
+    row_heights = [0.5, 0.25, 0.25] if has_pressure else [0.7, 0.3]
+    titles = ("Flow Rate & Active Gain Multiplier", "Residual Error", "Delta P Validation Check") if has_pressure else ("Flow Rate & Active Gain Multiplier", "Residual Error")
     
-    # NEW: Add a zero-line to residuals to easily see balance
+    fig = make_subplots(rows=fig_rows, cols=1, shared_xaxes=True, row_heights=row_heights, 
+                        subplot_titles=titles, specs=[[{"secondary_y": True}], [{"secondary_y": False}]] + ([[{'secondary_y': False}]] if has_pressure else []))
+
+    fig.add_trace(go.Scatter(x=pdf.index, y=pdf[sink_q_col], mode='lines', name='Cleaned Sink Q', line=dict(color='#ff7f0e')), row=1, col=1)
+    fig.add_trace(go.Scatter(x=pdf.index, y=pdf['Reconciled_Source_Q'], mode='lines', name='Reconciled Source Q', line=dict(color='#1f77b4', dash='dot')), row=1, col=1)
+    fig.add_trace(go.Scatter(x=pdf.index, y=pdf['Active_Gain'], mode='lines', name='Segment Gain', line=dict(color='rgba(44, 160, 44, 0.6)', width=2, shape='hv')), row=1, col=1, secondary_y=True)
+
+    diff = pdf['Reconciled_Source_Q'] - pdf[sink_q_col]
+    fig.add_trace(go.Scatter(x=pdf.index, y=diff, mode='lines', name='Delta Q', line=dict(color='gray')), row=2, col=1)
     fig.add_hline(y=0, line_dash="dash", line_color="black", opacity=0.5, row=2, col=1)
 
-    if anomalies:
-        fig.add_vrect(x0=min(anomalies), x1=max(anomalies), 
-                      fillcolor="red", opacity=0.15, layer="below")
+    if has_pressure:
+        delta_p = pdf[source_p_col] - pdf[sink_p_col]
+        fig.add_trace(go.Scatter(x=pdf.index, y=delta_p, mode='lines', name='Measured Delta P', fill='tozeroy', fillcolor='rgba(148, 103, 189, 0.2)', line=dict(color='#9467bd')), row=3, col=1)
 
-    fig.update_layout(height=600, hovermode="x unified", margin=dict(t=40, b=20))
+    fig.update_layout(height=800 if has_pressure else 600, hovermode="x unified", margin=dict(t=40, b=20))
     st.plotly_chart(fig, use_container_width=True)
 
-with tab2:
-    st.dataframe(df, use_container_width=True)
+    # fig = make_subplots(rows=3, cols=1, shared_xaxes=True, row_heights=[0.5, 0.25, 0.25], subplot_titles=("Flow Rate & Gain", "Residuals", "Delta P Check"), specs=[[{"secondary_y": True}], [{}], [{}]])
+    # fig.add_trace(go.Scatter(x=pdf.index, y=pdf['Sink_Q'], name='Sink Q'), row=1, col=1)
+    # fig.add_trace(go.Scatter(x=pdf.index, y=pdf['Reconciled_Source_Q'], name='Reconciled Source Q', line=dict(dash='dot')), row=1, col=1)
+    # fig.add_trace(go.Scatter(x=pdf.index, y=pdf['Active_Gain'], name='Gain', line=dict(shape='hv')), row=1, col=1, secondary_y=True)
+    # fig.add_trace(go.Scatter(x=pdf.index, y=pdf['Reconciled_Source_Q']-pdf['Sink_Q'], name='Delta Q'), row=2, col=1)
+    # fig.add_trace(go.Scatter(x=pdf.index, y=pdf['Source_P']-pdf['Sink_P'], name='Delta P'), row=3, col=1)
+    # st.plotly_chart(fig, use_container_width=True)
 
-with tab3:
-    st.markdown("### 1. Aggregated Meeting Points")
-    st.write(f"Showing times where the total calibrated source is within **{tolerance_pct*100:.2f}%** of the total sink.")
-    
-    is_meeting = abs(diff) <= (abs(sink_smoothed) * tolerance_pct)
-    meeting_times = df.index[is_meeting].tolist() 
-    
-    meeting_df = pd.DataFrame({
-        'Time_Index': meeting_times,
-        'Calibrated_Source': source_corrected[is_meeting].round(2),
-        'Smoothed_Sink': sink_smoothed[is_meeting].round(2),
-        'Difference': diff[is_meeting].round(2)
-    })
-    
-    if meeting_df.empty:
-        st.warning("No meeting points found with current calibration and tolerance settings.")
-    else:
-        st.dataframe(meeting_df, use_container_width=True)
-        
-        st.divider()
-        st.markdown("### 2. Export Filtered & Calibrated Node History")
-        
-        required_cols = ['Sources/Sinks', 'NAME', 'Time (Hr)', 'Water Q (STB)']
-        
-        if all(col in raw_full_df.columns for col in required_cols):
-            calibrated_raw_df = calibrate_raw_detailed_data(raw_full_df, gain, int(lag), pressure_offset, meeting_times)
-            st.dataframe(calibrated_raw_df, use_container_width=True) 
-            
-            st.download_button(
-                label="Download Calibrated Node History (CSV)",
-                data=calibrated_raw_df.to_csv(index=False).encode('utf-8'),
-                file_name='calibrated_meeting_nodes.csv',
-                mime='text/csv',
-                type='primary'
-            )
-        else:
-            st.warning(f"Detailed export requires columns: `{', '.join(required_cols)}`. Ensure your uploaded CSV contains these headers.")
+with t2:
+    st.dataframe(mdf, use_container_width=True)
 
-# ==========================================
-# 6. DIAGNOSTIC EXPLANATION
-# ==========================================
-st.divider()
-with st.expander("How to interpret this analysis"):
-    st.markdown("""
-    1.  **Calibration Error:** If the *Blue* and *Orange* lines have the same shape but different heights, adjust the **Calibration Factor** until they overlap. The `Suggested Gain` calculates this for you.
-    2.  **Timing Mismatch:** If the peaks are misaligned, adjust the **Lag Slider**.
-    3.  **Pressure Offset:** Use the new control to dial in your field gauges.
-    4.  **Leaks/Bursts:** Look at the bottom chart (Residuals).
-        * **Flat Line @ 0:** Perfect balance.
-        * **Negative Dip (Red):** Potential Leak or Burst.
-        * **Positive Spike:** Tank filling or sensor error.
-    """)
+with t3:
+    granular_full = generate_granular_node_export(raw_df, mdf)
+    st.dataframe(granular_full, use_container_width=True)
+    st.download_button("Download Full Granular Node CSV", granular_full.to_csv(index=False), "full_granular.csv")
+
+with t4:
+    st.markdown("### PIPESIM Batch Cases (Nodes Only)")
+    col_a, col_b = st.columns([1, 2])
+    num_cases = col_a.number_input("Number of Cases", 10, 500, 50)
+    exclude_f = col_b.checkbox("Exclude 'FAIL' Scores", value=True)
+    
+    if st.button("Generate Batch Node Export", type="primary"):
+        target_times, batch_summary = prep_pipesim_batch_cases(pdf, num_cases, exclude_f)
+        
+        # Filter the granular data to ONLY include those 50 timestamps
+        granular_full = generate_granular_node_export(raw_df, mdf)
+        batch_nodes = granular_full[granular_full['Time'].isin(target_times)].copy()
+        
+        # Add a Case_ID mapping
+        time_to_case = {t: f"Case_{str(i+1).zfill(3)}" for i, t in enumerate(target_times)}
+        batch_nodes['Case_ID'] = batch_nodes['Time'].map(time_to_case)
+        
+        st.write(f"Generated {len(target_times)} Cases with {len(batch_nodes)} Node entries.")
+        st.dataframe(batch_nodes[['Case_ID', 'Time', 'Type', 'Node_Name', 'Reconciled_Q', 'Pressure']], use_container_width=True)
+        
+        st.download_button(
+            label="Download Batch Node CSV for PIPESIM",
+            data=batch_nodes.to_csv(index=False).encode('utf-8'),
+            file_name='pipesim_batch_node_data.csv',
+            mime='text/csv'
+        )
